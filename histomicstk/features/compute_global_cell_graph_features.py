@@ -5,7 +5,7 @@ from collections import namedtuple
 import numpy as np
 from numpy import linalg
 from pandas import DataFrame
-from scipy.spatial import cKDTree as KDTree, Voronoi
+from scipy.spatial import Delaunay, cKDTree as KDTree, Voronoi
 from scipy import sparse
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial.distance import pdist
@@ -114,29 +114,26 @@ def _compute_global_cell_graph_features(
     max_dists = np.stack(pdist(vertices[r]).max() for r in regions)
     poly_props = PolyProps._make(map(_pop_stats, (areas, peris, max_dists)))
 
-    # Assume that each Voronoi vertex is on exactly three ridges.
-    ridge_points = vor.ridge_points
+    de = Delaunay(centroids)
+    # From the docs: "Coplanar points are input points which were not
+    # included in the triangulation due to numerical precision
+    # issues."  I don't know how this would affect the results if
+    # present, and it doesn't appear to happen, so it's excluded here.
+    assert not de.coplanar.size
+    indptr, indices = de.vertex_neighbor_vertices
+    bin_connectivity = sparse.csr_matrix((np.ones(len(indices), dtype=bool), indices, indptr), (len(centroids),) * 2)
+    ridge_points = sparse.triu(bin_connectivity, format='coo')
+    ridge_points = np.stack((ridge_points.row, ridge_points.col), axis=-1)
+
     # This isn't exactly the collection of sides, since if they should
     # be counted per-triangle then we weight border ridges wrong
     # relative to ridges that are part of two triangles.
     ridge_lengths = _dist(*np.swapaxes(centroids[ridge_points], 0, 1))
     sides = ridge_lengths
-    # Point indices of each triangle
-    tris = [[] for _ in vertices]
-    for p, ri in enumerate(vor.point_region):
-        for vi in vor.regions[ri]:
-            if vi != -1:
-                tris[vi].append(p)
-    # This will only fail in particular symmetrical cases where a
-    # Voronoi vertex is associated with more than three centroids.
-    # Since this should be unlikely in practice, we don't handle it
-    # beyond throwing an AssertionError
-    assert all(len(t) == 3 for t in tris)
-    tris = np.asarray(tris)
-    areas = np.stack(_poly_area(centroids[t]) for t in tris)
+    areas = np.stack(_poly_area(centroids[t]) for t in de.simplices)
     tri_props = TriProps._make(map(_pop_stats, (sides, areas)))
 
-    graph = sparse.coo_matrix((ridge_lengths, np.sort(ridge_points).T),
+    graph = sparse.coo_matrix((ridge_lengths, ridge_points.T),
                               (len(centroids), len(centroids)))
     mst = minimum_spanning_tree(graph)
     # Without looking into exactly how minimum_spanning_tree
